@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "openai>=1.0.0",
   "openai-agents>=0.2.0",
+  "pydantic>=2.0.0",
   "python-dotenv>=1.0.0",
 ]
 
@@ -19,4 +20,3 @@ roadmap-agents = "product_roadmap_agents.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["product_roadmap_agents*"]
-
