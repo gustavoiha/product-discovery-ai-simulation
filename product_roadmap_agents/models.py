@@ -30,6 +30,12 @@ class InterviewExchange(BaseModel):
     answer: str
 
 
+class HypothesisCheck(BaseModel):
+    hypothesis: str
+    status: Literal["validated", "mixed", "invalidated", "insufficient"] = "insufficient"
+    evidence: str = ""
+
+
 class InterviewReport(BaseModel):
     persona_name: str
     persona_profile: str = ""
@@ -39,6 +45,7 @@ class InterviewReport(BaseModel):
     risks_or_objections: list[str] = Field(default_factory=list)
     broad_signals: list[str] = Field(default_factory=list)
     niche_signals: list[str] = Field(default_factory=list)
+    hypothesis_checks: list[HypothesisCheck] = Field(default_factory=list)
     synthesis: str = ""
 
 
@@ -72,6 +79,15 @@ class RoadmapCandidate(BaseModel):
     niche_penalty: int = Field(default=0, ge=0, le=5)
 
 
+class CompetitorResearchReport(BaseModel):
+    scope: str = ""
+    competitor_set: list[str] = Field(default_factory=list)
+    notable_patterns: list[str] = Field(default_factory=list)
+    differentiation_opportunities: list[str] = Field(default_factory=list)
+    roadmap_implications: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+
+
 class PMResponse(BaseModel):
     phase: PMPhase
     assistant_message: str
@@ -80,6 +96,7 @@ class PMResponse(BaseModel):
     roadmap_ready: bool = False
     product_summary: str = ""
     focus_areas: list[str] = Field(default_factory=list)
+    hypotheses: list[str] = Field(default_factory=list)
     accepted_signals: list[str] = Field(default_factory=list)
     rejected_signals: list[str] = Field(default_factory=list)
     deprioritized_feedback: list[str] = Field(default_factory=list)

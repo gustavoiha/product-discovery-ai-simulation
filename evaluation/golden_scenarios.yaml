@@ -1,0 +1,22 @@
+scenarios:
+  - id: b2b_saas_efficiency
+    description: B2B SaaS roadmap should include prioritization buckets, hypotheses, and deprioritization.
+    expected_characteristics:
+      - contains_section:## Now
+      - contains_section:## Next
+      - contains_section:## Later
+      - contains_section:## Hypotheses
+      - contains_section:## Deprioritized Feedback
+      - contains_keyword:score
+      - min_occurrences:### |2
+
+  - id: mobile_smb_usability
+    description: Mobile SMB roadmap should include signals and explicit prioritization method.
+    expected_characteristics:
+      - contains_section:## Prioritization Method
+      - contains_section:## Accepted Signals
+      - contains_section:## Rejected / Niche Signals
+      - contains_keyword:mobile
+      - contains_keyword:niche
+      - min_occurrences:### |2
+

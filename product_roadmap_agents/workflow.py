@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover - backwards compatibility
 
 from .config import WorkflowSettings
 from .models import (
+    CompetitorResearchReport,
+    HypothesisCheck,
     PMPhase,
     PMResponse,
     InterviewExchange,
@@ -34,7 +36,7 @@ from .models import (
     RoadmapCandidate,
     SimulatorResponse,
 )
-from .personas import Persona, USER_SIMULATOR_PERSONAS
+from .personas import Persona, load_personas
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -83,6 +85,12 @@ def _bullet_items(items: list[str], empty_text: str) -> list[str]:
     return [f"- {item}" for item in items]
 
 
+def _prompt_bullets(items: list[str], empty_text: str) -> str:
+    if not items:
+        return f"- {empty_text}"
+    return "\n".join(f"- {item}" for item in items)
+
+
 def _coerce_model(output: Any, model_cls: type[TModel]) -> TModel:
     if isinstance(output, model_cls):
         return output
@@ -108,6 +116,10 @@ class WorkflowState:
     selected_personas: list[str] = field(default_factory=list)
     interview_quality_scores: dict[str, float] = field(default_factory=dict)
     interview_reruns: dict[str, int] = field(default_factory=dict)
+    current_hypotheses: list[str] = field(default_factory=list)
+    last_product_context: str = ""
+    last_focus_areas: list[str] = field(default_factory=list)
+    competitor_report_path: Path | None = None
     accepted_signals: list[str] = field(default_factory=list)
     rejected_signals: list[str] = field(default_factory=list)
     budget_exhausted: bool = False
@@ -133,6 +145,7 @@ class ProductRoadmapWorkflow:
         self.output_dir = settings.output_dir.resolve()
         self.interviews_dir = self.output_dir / "interviews"
         self.roadmap_path = self.output_dir / "roadmap_recommendation.md"
+        self.competitor_report_path = self.output_dir / "competitor_research.md"
         self.summary_path = self.interviews_dir / "INTERVIEW_SUMMARY.md"
         self._rng = random.Random(11)
         self.conversation_id = f"product-roadmap-{uuid.uuid4()}"
@@ -162,9 +175,11 @@ class ProductRoadmapWorkflow:
         if set_tracing_disabled is not None:
             set_tracing_disabled(settings.disable_tracing)
 
+        self.personas = load_personas(self.settings.personas_config_path)
         self.simulator_agents = self._build_user_simulator_agents()
         self.interviewer_agent = self._build_interviewer_agent()
         self.interview_quality_agent = self._build_interview_quality_checker_agent()
+        self.competitor_research_agent = self._build_competitor_research_agent()
         self.pm_agent = self._build_product_manager_agent()
 
     def _model_settings(self) -> ModelSettings:
@@ -176,10 +191,11 @@ class ProductRoadmapWorkflow:
     def _build_user_simulator_agents(self) -> dict[str, Agent]:
         agents_by_slug: dict[str, Agent] = {}
 
-        for persona in USER_SIMULATOR_PERSONAS:
+        for persona in self.personas:
             instructions = (
                 "You are a simulated end user in a product discovery interview.\n"
                 f"Persona name: {persona.name}\n"
+                f"Persona segment: {persona.segment}\n"
                 f"Persona profile: {persona.profile}\n\n"
                 "Return a structured response for these fields:\n"
                 "- user_context\n"
@@ -208,13 +224,13 @@ class ProductRoadmapWorkflow:
 
     def _build_interviewer_agent(self) -> Agent:
         tools = []
-        for persona in USER_SIMULATOR_PERSONAS:
+        for persona in self.personas:
             tool_name = self._persona_tool_name(persona)
             tools.append(
                 self.simulator_agents[persona.slug].as_tool(
                     tool_name=tool_name,
                     tool_description=(
-                        f"Interview this simulated user persona: {persona.name}. "
+                        f"Interview this simulated user persona: {persona.name} ({persona.segment}). "
                         f"Profile: {persona.profile}"
                     ),
                     max_turns=self.settings.simulator_max_turns,
@@ -230,6 +246,7 @@ class ProductRoadmapWorkflow:
             "- Ask focused discovery questions.\n"
             "- Cover workflow, pain points, desired outcomes, feature ideas, and objections.\n"
             "- Distinguish broad signals from niche signals.\n"
+            "- Validate each provided hypothesis with explicit hypothesis_checks.\n"
             "- Keep transcript compact and useful."
         )
 
@@ -273,6 +290,21 @@ class ProductRoadmapWorkflow:
             model=self.settings.model,
             model_settings=self._model_settings(),
             output_type=InterviewQualityAssessment,
+        )
+
+    def _build_competitor_research_agent(self) -> Agent:
+        instructions = (
+            "You are a product strategy analyst doing lightweight competitor sanity checks.\n"
+            "Given product context and proposed roadmap themes, produce a concise structured report.\n"
+            "Focus on likely category patterns, differentiation opportunities, and roadmap implications.\n"
+            "Do not invent specific confidential metrics. Flag uncertainty in caveats."
+        )
+        return Agent(
+            name="Competitor Research Analyst",
+            instructions=instructions,
+            model=self.settings.model,
+            model_settings=self._model_settings(),
+            output_type=CompetitorResearchReport,
         )
 
     def _build_product_manager_agent(self) -> Agent:
@@ -325,6 +357,72 @@ class ProductRoadmapWorkflow:
             state.phase = PMPhase.SYNTHESIS
             return summary
 
+        @function_tool
+        async def run_competitor_research(
+            context: RunContextWrapper[WorkflowState],
+            product_context: str,
+            roadmap_focus: str = "",
+        ) -> str:
+            state = context.context
+            if not state.settings.enable_competitor_research:
+                return "Competitor research is disabled by configuration."
+            if state.phase not in {PMPhase.SYNTHESIS, PMPhase.ROADMAP}:
+                return (
+                    "Competitor research is only allowed in synthesis/roadmap phases. "
+                    f"Current phase: {state.phase.value}."
+                )
+            if state.budget_exhausted:
+                return (
+                    "Competitor research blocked: budget exhausted.\n"
+                    f"Reason: {state.budget_stop_reason}"
+                )
+
+            try:
+                self._enforce_budget_or_raise("competitor_research_run")
+            except BudgetExceededError as exc:
+                return f"Competitor research blocked: {exc}"
+
+            prompt = (
+                "Perform a lightweight competitor sanity check.\n\n"
+                f"Product context:\n{product_context.strip()}\n\n"
+                f"Roadmap focus:\n{(roadmap_focus or 'General roadmap direction from interviews').strip()}\n\n"
+                "Return a structured report."
+            )
+            started = time.monotonic()
+            result = await Runner.run(
+                self.competitor_research_agent,
+                prompt,
+                context=state,
+                max_turns=self.settings.competitor_research_max_turns,
+            )
+            latency_ms = round((time.monotonic() - started) * 1000, 2)
+            usage = self._usage_from_result(result)
+            self._add_usage(usage)
+
+            try:
+                report = _coerce_model(result.final_output, CompetitorResearchReport)
+            except Exception:
+                report = CompetitorResearchReport(
+                    scope="fallback",
+                    caveats=["Failed to parse structured competitor report."],
+                )
+
+            _write_text(self.competitor_report_path, self._render_competitor_markdown(report))
+            state.competitor_report_path = self.competitor_report_path
+            self._record_event(
+                "competitor_research_completed",
+                {
+                    "output_file": str(self.competitor_report_path.resolve()),
+                    "latency_ms": latency_ms,
+                    "usage": usage,
+                    **self._budget_snapshot(),
+                },
+            )
+            return (
+                "Competitor sanity check completed.\n"
+                f"- Report: {self.competitor_report_path.resolve()}"
+            )
+
         instructions = (
             "You are the Product Manager and the only point of contact with the human product owner.\n\n"
             "You must always return a structured PM response object.\n\n"
@@ -338,8 +436,11 @@ class ProductRoadmapWorkflow:
             "- In discovery, ask clarifying questions about product model, users, platforms, existing features, goals, constraints, and ideas.\n"
             "- Before interviews, you MUST ask exactly: \"How many interviews should I run?\"\n"
             "- Set ask_interview_count=true in that step.\n"
+            "- Before interviews, define 3-7 testable hypotheses and return them in hypotheses.\n"
             "- After interview count is provided, move to interviews and call run_user_research_interviews.\n"
             "- In synthesis, identify repeated signals and reject weak/niche signals.\n"
+            "- In synthesis, update hypotheses based on evidence from interview hypothesis_checks.\n"
+            "- If competitor research is enabled, optionally call run_competitor_research for market sanity checks before roadmap_ready=true.\n"
             "- For roadmap_ready=true, provide roadmap_candidates with scoring inputs (reach, impact, confidence, strategic_fit, effort, niche_penalty).\n"
             "- Do not set roadmap_ready=true unless roadmap_candidates is non-empty.\n"
             "- assistant_message must remain concise and user-facing."
@@ -350,7 +451,7 @@ class ProductRoadmapWorkflow:
             instructions=instructions,
             model=self.settings.model,
             model_settings=self._model_settings(),
-            tools=[run_user_research_interviews],
+            tools=[run_user_research_interviews, run_competitor_research],
             output_type=PMResponse,
         )
 
@@ -358,14 +459,40 @@ class ProductRoadmapWorkflow:
         return f"simulate_{persona.slug}"
 
     def _select_personas(self, interview_count: int) -> list[Persona]:
-        base = list(USER_SIMULATOR_PERSONAS)
+        base = list(self.personas)
         self._rng.shuffle(base)
-        if interview_count <= len(base):
-            return base[:interview_count]
+
+        if interview_count <= 0:
+            return []
+
+        if not self.settings.require_segment_coverage:
+            if interview_count <= len(base):
+                return base[:interview_count]
+            selected_no_quota: list[Persona] = []
+            while len(selected_no_quota) < interview_count:
+                selected_no_quota.extend(base)
+            return selected_no_quota[:interview_count]
+
+        by_segment: dict[str, list[Persona]] = {}
+        for persona in base:
+            by_segment.setdefault(persona.segment, []).append(persona)
+
+        segment_keys = list(by_segment.keys())
+        self._rng.shuffle(segment_keys)
 
         selected: list[Persona] = []
+        if interview_count <= len(segment_keys):
+            for segment in segment_keys[:interview_count]:
+                bucket = by_segment[segment]
+                selected.append(bucket[self._rng.randrange(len(bucket))])
+            return selected
+
+        for segment in segment_keys:
+            bucket = by_segment[segment]
+            selected.append(bucket[self._rng.randrange(len(bucket))])
+
         while len(selected) < interview_count:
-            selected.extend(base)
+            selected.append(base[self._rng.randrange(len(base))])
         return selected[:interview_count]
 
     def _extract_interview_count(self, user_text: str) -> int | None:
@@ -516,6 +643,12 @@ class ProductRoadmapWorkflow:
         lines.extend(_bullet_items(report.broad_signals, "(none captured)"))
         lines.extend(["", "## Niche Signals"])
         lines.extend(_bullet_items(report.niche_signals, "(none captured)"))
+        lines.extend(["", "## Hypothesis Checks"])
+        if not report.hypothesis_checks:
+            lines.append("- (none captured)")
+        else:
+            for check in report.hypothesis_checks:
+                lines.append(f"- {check.hypothesis}: {check.status} ({check.evidence or 'no evidence provided'})")
         lines.extend(["", "## Synthesis", report.synthesis or "(none provided)"])
         lines.extend(["", "## Interview Quality"])
         if quality is None:
@@ -555,12 +688,18 @@ class ProductRoadmapWorkflow:
     ) -> str:
         all_broad: list[str] = []
         all_niche: list[str] = []
+        hypothesis_lines: list[str] = []
         for report in reports:
             all_broad.extend(report.broad_signals)
             all_niche.extend(report.niche_signals)
+            for check in report.hypothesis_checks:
+                hypothesis_lines.append(
+                    f"- [{report.persona_name}] {check.hypothesis} -> {check.status}: {check.evidence or '(no evidence)'}"
+                )
 
         quality_values = list(self.state.interview_quality_scores.values())
         avg_quality = round(sum(quality_values) / len(quality_values), 2) if quality_values else 0.0
+        hypothesis_section = hypothesis_lines if hypothesis_lines else ["- (none)"]
 
         lines = [
             "# Interview Summary",
@@ -585,6 +724,9 @@ class ProductRoadmapWorkflow:
             "",
             "## Aggregated niche signals",
             *_bullet_items(all_niche, "(none)"),
+            "",
+            "## Hypothesis Validation",
+            *hypothesis_section,
         ]
         return "\n".join(lines)
 
@@ -678,6 +820,45 @@ class ProductRoadmapWorkflow:
                 *_bullet_items(pm_output.deprioritized_feedback, "(none)"),
             ]
         )
+        lines.extend(
+            [
+                "",
+                "## Hypotheses",
+                *_bullet_items(pm_output.hypotheses, "(none)"),
+            ]
+        )
+        if self.state.competitor_report_path is not None:
+            lines.extend(
+                [
+                    "",
+                    "## Competitor Sanity Check",
+                    f"- Report: {self.state.competitor_report_path.resolve()}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _render_competitor_markdown(self, report: CompetitorResearchReport) -> str:
+        lines = [
+            "# Competitor Sanity Check",
+            "",
+            "## Scope",
+            report.scope or "(not provided)",
+            "",
+            "## Competitor Set",
+            *_bullet_items(report.competitor_set, "(not provided)"),
+            "",
+            "## Notable Patterns",
+            *_bullet_items(report.notable_patterns, "(none)"),
+            "",
+            "## Differentiation Opportunities",
+            *_bullet_items(report.differentiation_opportunities, "(none)"),
+            "",
+            "## Roadmap Implications",
+            *_bullet_items(report.roadmap_implications, "(none)"),
+            "",
+            "## Caveats",
+            *_bullet_items(report.caveats, "(none)"),
+        ]
         return "\n".join(lines)
 
     def _finalize_run_summary(self) -> None:
@@ -690,6 +871,14 @@ class ProductRoadmapWorkflow:
             "selected_personas": self.state.selected_personas,
             "interview_quality_scores": self.state.interview_quality_scores,
             "interview_reruns": self.state.interview_reruns,
+            "current_hypotheses": self.state.current_hypotheses,
+            "last_focus_areas": self.state.last_focus_areas,
+            "last_product_context": self.state.last_product_context,
+            "competitor_report_path": (
+                str(self.state.competitor_report_path)
+                if self.state.competitor_report_path is not None
+                else None
+            ),
             "interview_quality_equation": self._interview_quality_equation(),
             "interview_quality_min_score": self.settings.interview_quality_min_score,
             "accepted_signals": self.state.accepted_signals,
@@ -717,6 +906,12 @@ class ProductRoadmapWorkflow:
             )
 
         selected_personas = self._select_personas(interview_count)
+        self.state.last_product_context = product_context.strip()
+        self.state.last_focus_areas = [
+            line.strip("- ").strip()
+            for line in focus_areas.splitlines()
+            if line.strip()
+        ]
         self.state.selected_personas = [p.slug for p in selected_personas]
         self.state.interview_files.clear()
         self.state.interview_quality_scores.clear()
@@ -730,6 +925,7 @@ class ProductRoadmapWorkflow:
                 "interview_count": interview_count,
                 "selected_personas": self.state.selected_personas,
                 "focus_areas": focus_areas,
+                "hypotheses": self.state.current_hypotheses,
                 "quality_min_score": self.settings.interview_quality_min_score,
                 "quality_max_reruns_per_interview": self.settings.quality_max_reruns_per_interview,
                 "quality_equation": self._interview_quality_equation(),
@@ -750,6 +946,9 @@ class ProductRoadmapWorkflow:
                 f"{product_context.strip()}\n\n"
                 "Focus areas to probe:\n"
                 f"{(focus_areas or 'General value, usability, and prioritization feedback.').strip()}\n\n"
+                "Hypotheses to validate:\n"
+                f"{_prompt_bullets(self.state.current_hypotheses, '(none provided)')}\n\n"
+                "For each hypothesis, add an entry in hypothesis_checks with status and evidence.\n\n"
                 "Return a complete structured interview report."
             )
 
@@ -960,6 +1159,7 @@ class ProductRoadmapWorkflow:
                     "index": index,
                     "persona_slug": persona.slug,
                     "persona_name": persona.name,
+                    "persona_segment": persona.segment,
                     "prompt": base_prompt,
                     "output_file": str(file_path.resolve()),
                     "broad_signal_count": len(best_report.broad_signals),
@@ -1008,6 +1208,21 @@ class ProductRoadmapWorkflow:
             if self.state.confirmed_interview_count is not None
             else "unset"
         )
+        hypotheses_text = (
+            "\n".join(f"- {h}" for h in self.state.current_hypotheses)
+            if self.state.current_hypotheses
+            else "- (none yet)"
+        )
+        focus_text = (
+            "\n".join(f"- {f}" for f in self.state.last_focus_areas)
+            if self.state.last_focus_areas
+            else "- (none yet)"
+        )
+        competitor_path = (
+            str(self.state.competitor_report_path.resolve())
+            if self.state.competitor_report_path is not None
+            else "none"
+        )
         return (
             "Workflow context:\n"
             f"- Current phase: {self.state.phase.value}\n"
@@ -1015,16 +1230,225 @@ class ProductRoadmapWorkflow:
             f"- Confirmed interview count: {interview_count_text}\n"
             f"- Max interviews: {self.settings.max_interviews}\n"
             f"- Interview summary path: {self.summary_path.resolve()}\n\n"
+            "Current hypotheses:\n"
+            f"{hypotheses_text}\n\n"
+            "Last focus areas:\n"
+            f"{focus_text}\n\n"
+            f"Competitor report path: {competitor_path}\n\n"
             f"Human message:\n{user_input}"
         )
 
     def _sync_signals(self, pm_output: PMResponse) -> None:
+        if pm_output.hypotheses:
+            self.state.current_hypotheses = list(dict.fromkeys(pm_output.hypotheses))
+        if pm_output.focus_areas:
+            self.state.last_focus_areas = list(dict.fromkeys(pm_output.focus_areas))
         for signal in pm_output.accepted_signals:
             if signal not in self.state.accepted_signals:
                 self.state.accepted_signals.append(signal)
         for signal in pm_output.rejected_signals:
             if signal not in self.state.rejected_signals:
                 self.state.rejected_signals.append(signal)
+
+    def _persona_from_slug(self, slug: str) -> Persona | None:
+        for persona in self.personas:
+            if persona.slug == slug:
+                return persona
+        return None
+
+    def _print_help(self) -> None:
+        print(
+            "\nCommands:\n"
+            "- :help\n"
+            "- :status\n"
+            "- :show interviews\n"
+            "- :rerun interview <n>\n"
+            "- :export roadmap [path]"
+        )
+
+    def _print_status(self) -> None:
+        competitor_path = (
+            str(self.state.competitor_report_path.resolve())
+            if self.state.competitor_report_path is not None
+            else "none"
+        )
+        print(
+            "\nStatus:\n"
+            f"- phase: {self.state.phase.value}\n"
+            f"- interview question asked: {self.state.interview_question_asked}\n"
+            f"- confirmed interview count: {self.state.confirmed_interview_count}\n"
+            f"- interviews produced: {len(self.state.interview_files)}\n"
+            f"- hypotheses: {len(self.state.current_hypotheses)}\n"
+            f"- competitor report: {competitor_path}\n"
+            f"- budget exhausted: {self.state.budget_exhausted}\n"
+            f"- budget snapshot: {json.dumps(self._budget_snapshot(), ensure_ascii=False)}"
+        )
+
+    def _print_interviews(self) -> None:
+        if not self.state.interview_files:
+            print("\nNo interviews generated yet.")
+            return
+        print("\nInterviews:")
+        for idx, file_path in enumerate(self.state.interview_files, start=1):
+            slug = (
+                self.state.selected_personas[idx - 1]
+                if idx - 1 < len(self.state.selected_personas)
+                else "unknown"
+            )
+            score = self.state.interview_quality_scores.get(slug, 0.0)
+            reruns = self.state.interview_reruns.get(slug, 0)
+            print(
+                f"- {idx}: {file_path.resolve()} | persona={slug} | quality={score} | reruns={reruns}"
+            )
+
+    def _export_roadmap(self, target: str | None) -> None:
+        if self.state.roadmap_saved_path is None or not self.state.roadmap_saved_path.exists():
+            print("\nNo roadmap exists yet to export.")
+            return
+        if target:
+            export_path = Path(target).expanduser()
+        else:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            export_path = self.output_dir / "exports" / f"roadmap_{stamp}.md"
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export_path.write_text(
+            self.state.roadmap_saved_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        print(f"\nExported roadmap to: {export_path.resolve()}")
+
+    async def _rerun_interview(self, interview_number: int) -> None:
+        if interview_number < 1 or interview_number > len(self.state.selected_personas):
+            print("\nInvalid interview number.")
+            return
+        if not self.state.last_product_context:
+            print("\nCannot rerun: no interview context stored yet.")
+            return
+
+        slug = self.state.selected_personas[interview_number - 1]
+        persona = self._persona_from_slug(slug)
+        if persona is None:
+            print("\nCannot rerun: persona definition not found.")
+            return
+        if self.state.budget_exhausted:
+            print(
+                "\nCannot rerun interview: budget exhausted.\n"
+                f"Reason: {self.state.budget_stop_reason}"
+            )
+            return
+
+        focus_areas = (
+            "\n".join(self.state.last_focus_areas)
+            if self.state.last_focus_areas
+            else "General value, usability, and prioritization feedback."
+        )
+        try:
+            self._enforce_budget_or_raise("manual_rerun_interview")
+        except BudgetExceededError as exc:
+            print(f"\nCannot rerun interview: {exc}")
+            return
+
+        single_count = max(1, len(self.state.selected_personas))
+        tool_name = self._persona_tool_name(persona)
+        prompt = (
+            f"Conduct interview {interview_number} of {single_count}.\n"
+            f"You must use simulator tool `{tool_name}` exactly once.\n\n"
+            "Interview context from Product Manager:\n"
+            f"{self.state.last_product_context}\n\n"
+            "Focus areas to probe:\n"
+            f"{focus_areas}\n\n"
+            "Hypotheses to validate:\n"
+            f"{_prompt_bullets(self.state.current_hypotheses, '(none provided)')}\n\n"
+            "For each hypothesis, add an entry in hypothesis_checks with status and evidence.\n\n"
+            "Return a complete structured interview report."
+        )
+
+        result = await Runner.run(
+            self.interviewer_agent,
+            prompt,
+            context=self.state,
+            max_turns=self.settings.interviewer_max_turns,
+        )
+        usage = self._usage_from_result(result)
+        self._add_usage(usage)
+
+        try:
+            report = _coerce_model(result.final_output, InterviewReport)
+        except Exception:
+            report = InterviewReport(
+                persona_name=persona.name,
+                persona_profile=persona.profile,
+                transcript=[
+                    InterviewExchange(
+                        question="(parse_error)",
+                        answer=_to_text(result.final_output),
+                    )
+                ],
+                synthesis="Model output was not parseable as InterviewReport.",
+            )
+        if not report.persona_name:
+            report.persona_name = persona.name
+        if not report.persona_profile:
+            report.persona_profile = persona.profile
+
+        quality_prompt = (
+            "Evaluate this interview report for decision-useful signal quality.\n"
+            f"Use this exact scoring equation for interpretation:\n{self._interview_quality_equation()}\n"
+            f"Threshold for shallow interview: score < {self.settings.interview_quality_min_score}\n\n"
+            "Interview report JSON:\n"
+            f"{report.model_dump_json(indent=2)}"
+        )
+        try:
+            self._enforce_budget_or_raise("manual_rerun_quality_checker")
+        except BudgetExceededError as exc:
+            print(f"\nCannot run quality checker after rerun: {exc}")
+            return
+        quality_result = await Runner.run(
+            self.interview_quality_agent,
+            quality_prompt,
+            context=self.state,
+            max_turns=self.settings.quality_checker_max_turns,
+        )
+        quality_usage = self._usage_from_result(quality_result)
+        self._add_usage(quality_usage)
+        try:
+            quality = _coerce_model(quality_result.final_output, InterviewQualityAssessment)
+        except Exception:
+            quality = InterviewQualityAssessment(
+                summary="Quality parse failure",
+                weaknesses=["Could not parse QC output"],
+                rerun_focus_areas=[],
+                question_depth=1,
+                answer_specificity=1,
+                signal_diversity=1,
+                actionability=1,
+                noise_penalty=3,
+                niche_bias_penalty=1,
+                rerun_recommended=False,
+            )
+        quality_score = self._score_interview_quality(quality)
+        self.state.interview_quality_scores[slug] = quality_score
+        self.state.interview_reruns[slug] = self.state.interview_reruns.get(slug, 0) + 1
+
+        file_path = self.interviews_dir / f"interview_{interview_number:02d}_{slug}.md"
+        _write_text(
+            file_path,
+            self._render_interview_markdown(
+                report,
+                interview_number,
+                quality=quality,
+                quality_score=quality_score,
+                reruns_used=self.state.interview_reruns[slug],
+            ),
+        )
+        if interview_number - 1 < len(self.state.interview_files):
+            self.state.interview_files[interview_number - 1] = file_path
+        else:
+            self.state.interview_files.append(file_path)
+
+        print(
+            f"\nReran interview {interview_number} ({slug}). "
+            f"New quality score: {quality_score}."
+        )
 
     async def run_cli(self) -> None:
         print("Product roadmap workflow started.")
@@ -1041,6 +1465,11 @@ class ProductRoadmapWorkflow:
                 "quality_checker_max_turns": self.settings.quality_checker_max_turns,
                 "max_output_tokens": self.settings.max_output_tokens,
                 "max_interviews": self.settings.max_interviews,
+                "personas_config_path": str(self.settings.personas_config_path),
+                "persona_count": len(self.personas),
+                "require_segment_coverage": self.settings.require_segment_coverage,
+                "enable_competitor_research": self.settings.enable_competitor_research,
+                "competitor_research_max_turns": self.settings.competitor_research_max_turns,
                 "interview_quality_min_score": self.settings.interview_quality_min_score,
                 "quality_max_reruns_per_interview": self.settings.quality_max_reruns_per_interview,
                 "total_token_budget": self.settings.total_token_budget,
@@ -1066,6 +1495,29 @@ class ProductRoadmapWorkflow:
             if user_input.lower() in {"exit", "quit"}:
                 self._record_event("session_exit_requested", {"user_input": user_input})
                 break
+
+            if user_input.startswith(":"):
+                command = user_input[1:].strip()
+                command_lower = command.lower()
+                if command_lower == "help":
+                    self._print_help()
+                elif command_lower == "status":
+                    self._print_status()
+                elif command_lower == "show interviews":
+                    self._print_interviews()
+                elif command_lower.startswith("rerun interview "):
+                    number_raw = command_lower.replace("rerun interview ", "", 1).strip()
+                    if number_raw.isdigit():
+                        await self._rerun_interview(int(number_raw))
+                    else:
+                        print("\nUsage: :rerun interview <number>")
+                elif command_lower.startswith("export roadmap"):
+                    parts = command.split(maxsplit=2)
+                    target = parts[2] if len(parts) > 2 else None
+                    self._export_roadmap(target)
+                else:
+                    print("\nUnknown command. Use :help")
+                continue
 
             if self.state.phase == PMPhase.ASK_INTERVIEW_COUNT:
                 parsed_count = self._extract_interview_count(user_input)

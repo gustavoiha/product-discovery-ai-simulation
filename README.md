@@ -11,11 +11,15 @@ Local multi-agent workflow built with the OpenAI Agents SDK, following the orche
 - The PM must ask: **"How many interviews should I run?"**
 - The PM flow is controlled by an explicit state machine:
   - `discovery -> ask_interview_count -> interviews -> synthesis -> roadmap`
+- Personas are loaded from `config/personas.yaml` (external configurable file).
 - The PM calls an `Interviewer` agent to run simulated user interviews.
 - The interviewer conducts interviews with multiple persona-based `User Simulator` agents.
+- Interview sampling can enforce segment coverage quotas so each segment is represented.
 - A dedicated `Interview Quality Checker` agent scores every interview and can trigger reruns for shallow transcripts.
 - Agent responses are structured with Pydantic schemas, then rendered to markdown files.
 - Each interview is saved as its own markdown file.
+- Interviews include hypothesis validation (`validated|mixed|invalidated|insufficient`) per hypothesis.
+- Optional competitor sanity-check agent can be invoked during synthesis.
 - The PM synthesizes findings and generates a practical product roadmap, filtering out noisy/niche feedback.
 - Roadmap items are scored with weighted prioritization:
   - `(reach x impact x confidence x strategic_fit) / effort - niche_penalty`
@@ -48,6 +52,12 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+For evaluation tests:
+
+```bash
+pip install -e ".[dev]"
+```
+
 3. Configure environment:
 
 ```bash
@@ -74,6 +84,32 @@ roadmap-agents
 - Observability artifacts (per run):
   - `outputs/observability/<run_id>/events.jsonl`
   - `outputs/observability/<run_id>/run_summary.json`
+- Optional competitor sanity check:
+  - `outputs/competitor_research.md`
+
+## CLI Commands
+
+During `roadmap-agents`, you can use:
+
+- `:help`
+- `:status`
+- `:show interviews`
+- `:rerun interview <n>`
+- `:export roadmap [path]`
+
+## Golden Evaluation Suite
+
+Golden scenarios and fixtures:
+
+- `evaluation/golden_scenarios.yaml`
+- `evaluation/sample_roadmaps/*.md`
+
+Run checks (CI-friendly):
+
+```bash
+python3 scripts/evaluate_golden.py
+pytest -q
+```
 
 ## Configuration
 
@@ -93,6 +129,10 @@ You can set these in `.env`:
 - `MAX_ESTIMATED_COST_USD` (default: `3.0`)
 - `EST_INPUT_COST_PER_1M_TOKENS_USD` (default: `1.25`)
 - `EST_OUTPUT_COST_PER_1M_TOKENS_USD` (default: `10.0`)
+- `PERSONAS_CONFIG_PATH` (default: `config/personas.yaml`)
+- `REQUIRE_SEGMENT_COVERAGE` (default: `true`)
+- `ENABLE_COMPETITOR_RESEARCH` (default: `false`)
+- `COMPETITOR_RESEARCH_MAX_TURNS` (default: `6`)
 - `OUTPUT_DIR` (default: `outputs`)
 - `DISABLE_TRACING` (`true`/`false`)
 

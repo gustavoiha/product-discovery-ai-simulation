@@ -27,6 +27,10 @@ class WorkflowSettings:
     max_estimated_cost_usd: float = 3.0
     est_input_cost_per_1m_tokens_usd: float = 1.25
     est_output_cost_per_1m_tokens_usd: float = 10.0
+    personas_config_path: Path = Path("config/personas.yaml")
+    require_segment_coverage: bool = True
+    enable_competitor_research: bool = False
+    competitor_research_max_turns: int = 6
     output_dir: Path = Path("outputs")
     disable_tracing: bool = False
 
@@ -53,6 +57,14 @@ class WorkflowSettings:
             ),
             est_output_cost_per_1m_tokens_usd=float(
                 os.getenv("EST_OUTPUT_COST_PER_1M_TOKENS_USD", "10.0")
+            ),
+            personas_config_path=Path(
+                os.getenv("PERSONAS_CONFIG_PATH", "config/personas.yaml")
+            ),
+            require_segment_coverage=_bool_env("REQUIRE_SEGMENT_COVERAGE", True),
+            enable_competitor_research=_bool_env("ENABLE_COMPETITOR_RESEARCH", False),
+            competitor_research_max_turns=int(
+                os.getenv("COMPETITOR_RESEARCH_MAX_TURNS", "6")
             ),
             output_dir=Path(os.getenv("OUTPUT_DIR", "outputs")),
             disable_tracing=_bool_env("DISABLE_TRACING", False),
@@ -85,3 +97,5 @@ class WorkflowSettings:
             raise ValueError("EST_INPUT_COST_PER_1M_TOKENS_USD must be >= 0.")
         if self.est_output_cost_per_1m_tokens_usd < 0:
             raise ValueError("EST_OUTPUT_COST_PER_1M_TOKENS_USD must be >= 0.")
+        if self.competitor_research_max_turns < 1:
+            raise ValueError("COMPETITOR_RESEARCH_MAX_TURNS must be >= 1.")
